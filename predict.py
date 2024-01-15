@@ -50,6 +50,8 @@ from utils.inference_utils import (
 class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
+        # The weights are downloaded to ./checkpoints first, with
+        # wget https://github.com/OpenTalker/video-retalking/releases/download/v0.0.1/<file_name>
         self.enhancer = FaceEnhancement(
             base_dir="checkpoints",
             size=512,
@@ -69,16 +71,17 @@ class Predictor(BasePredictor):
         )
         self.croper = Croper("checkpoints/shape_predictor_68_face_landmarks.dat")
         self.kp_extractor = KeypointExtractor()
-
-        face3d_net_path = "checkpoints/face3d_pretrain_epoch_20.pth"
-
-        self.net_recon = load_face3d_net(face3d_net_path, "cuda")
+        self.net_recon = load_face3d_net(
+            "checkpoints/face3d_pretrain_epoch_20.pth", "cuda"
+        )
         self.lm3d_std = load_lm3d("checkpoints/BFM")
 
     def predict(
         self,
         face: Path = Input(description="Input video file of a talking-head."),
-        input_audio: Path = Input(description="Input audio file."),
+        input_audio: Path = Input(
+            description="Input audio file. Avoid special symbol in the filename as it may cause ffmpeg erros."
+        ),
     ) -> Path:
         """Run a single prediction on the model"""
         device = "cuda"
@@ -103,7 +106,7 @@ class Predictor(BasePredictor):
             up_face="original",
             one_shot=False,
             without_rl1=False,
-            tmp_dir="temp",
+            tmp_dir="cog_temp",
             re_preprocess=False,
         )
 
@@ -111,9 +114,9 @@ class Predictor(BasePredictor):
             shutil.rmtree(args.tmp_dir)
         os.makedirs(args.tmp_dir)
 
-        # base_name = "input_face.m"   # args.face.split("/")[-1]
-        # tmp_dir = "cog_dir"
-        base_name = f"input_face{os.path.splitext(args.face)[-1]}"
+        output_file = "/tmp/output.mp4"
+        if os.path.exists(output_file):
+            os.remove(output_file)
 
         if args.face.split(".")[1] in ["jpg", "png", "jpeg"]:
             full_frames = [cv2.imread(args.face)]
@@ -135,6 +138,7 @@ class Predictor(BasePredictor):
                     y2 = frame.shape[0]
                 frame = frame[y1:y2, x1:x2]
                 full_frames.append(frame)
+            video_stream.release()
 
         full_frames_RGB = [
             cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in full_frames
@@ -156,24 +160,11 @@ class Predictor(BasePredictor):
         ]
 
         # get the landmark according to the detected face.
-        # if (
-        #     not os.path.isfile("temp/" + base_name + "_landmarks.txt")
-        #     or args.re_preprocess
-        # ):
         print("[Step 1] Landmarks Extraction in Video.")
         lm = self.kp_extractor.extract_keypoint(
             frames_pil, f"{args.tmp_dir}/landmarks.txt"
         )
-        # else:
-        #     print("[Step 1] Using saved landmarks.")
-        #     lm = np.loadtxt("temp/" + base_name + "_landmarks.txt").astype(np.float32)
-        #     lm = lm.reshape([len(full_frames), -1, 2])
 
-        # if (
-        #     not os.path.isfile("temp/" + base_name + "_coeffs.npy")
-        #     or args.exp_img is not None
-        #     or args.re_preprocess
-        # ):
         video_coeffs = []
         for idx in tqdm(
             range(len(frames_pil)), desc="[Step 2] 3DMM Extraction In Video:"
@@ -215,14 +206,7 @@ class Predictor(BasePredictor):
             )
             video_coeffs.append(pred_coeff)
         semantic_npy = np.array(video_coeffs)[:, 0]
-        # np.save(f"{tmp_dir}/_coeffs.npy", semantic_npy)
-        # else:
-        #     print("[Step 2] Using saved coeffs.")
-        #     semantic_npy = np.load("temp/" + base_name + "_coeffs.npy").astype(
-        #         np.float32
-        #     )
 
-        # generate the 3dmm coeff from a single image
         if args.exp_img == "smile":
             expression = torch.tensor(
                 loadmat("checkpoints/expression.mat")["expression_mouth"]
@@ -236,10 +220,6 @@ class Predictor(BasePredictor):
         # load DNet, model(LNet and ENet)
         D_Net, model = load_model(args, device)
 
-        # if (
-        #     not os.path.isfile("temp/" + base_name + "_stablized.npy")
-        #     or args.re_preprocess
-        # ):
         imgs = []
         for idx in tqdm(
             range(len(frames_pil)),
@@ -272,11 +252,8 @@ class Predictor(BasePredictor):
                 * 255
             )
             imgs.append(cv2.cvtColor(img_stablized, cv2.COLOR_RGB2BGR))
-        # np.save("temp/" + base_name + "_stablized.npy", imgs)
+
         del D_Net
-        # else:
-        #     print("[Step 3] Using saved stabilized video.")
-        #     imgs = np.load("temp/" + base_name + "_stablized.npy")
         torch.cuda.empty_cache()
 
         if not args.audio.endswith(".wav"):
@@ -314,7 +291,12 @@ class Predictor(BasePredictor):
             )
             imgs_enhanced.append(pred)
         gen = datagen(
-            imgs_enhanced.copy(), mel_chunks, full_frames, args, (oy1, oy2, ox1, ox2)
+            args.tmp_dir,
+            imgs_enhanced.copy(),
+            mel_chunks,
+            full_frames,
+            args,
+            (oy1, oy2, ox1, ox2),
         )
 
         frame_h, frame_w = full_frames[0].shape[:-1]
@@ -430,18 +412,16 @@ class Predictor(BasePredictor):
                 out.write(pp)
         out.release()
 
-        # output_file = "/tmp/output.mp4"
-        output_file = "output.mp4"
         command = "ffmpeg -loglevel error -y -i {} -i {} -strict -2 -q:v 1 {}".format(
             args.audio, f"{args.tmp_dir}/result.mp4", output_file
         )
-        subprocess.call(command, shell=True)
 
+        subprocess.call(command, shell=True)
         return Path(output_file)
 
 
 # frames:256x256, full_frames: original size
-def datagen(frames, mels, full_frames, args, cox):
+def datagen(tmp_dir, frames, mels, full_frames, args, cox):
     img_batch, mel_batch, frame_batch, coords_batch, ref_batch, full_frame_batch = (
         [],
         [],
@@ -458,11 +438,11 @@ def datagen(frames, mels, full_frames, args, cox):
     kp_extractor = KeypointExtractor()
     fr_pil = [Image.fromarray(frame) for frame in frames]
     lms = kp_extractor.extract_keypoint(
-        fr_pil, "temp/" + base_name + "x12_landmarks.txt"
+        fr_pil, f"{tmp_dir}/" + base_name + "x12_landmarks.txt"
     )
     frames_pil = [
         (lm, frame) for frame, lm in zip(fr_pil, lms)
-    ]  # frames is the croped version of modified face
+    ]  # frames is the cropped version of modified face
     crops, orig_images, quads = crop_faces(
         image_size, frames_pil, scale=1.0, use_fa=True
     )
