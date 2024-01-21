@@ -61,6 +61,7 @@ def triangular_affine_matrices(vertices, src_points, dest_points):
   """
   Calculate the affine transformation matrix for each
   triangle (x,y) vertex from dest_points to src_points
+  and calculate one of the foundation transformers
 
   :param vertices: array of triplet indices to corners of triangle
   :param src_points: array of [x, y] points to landmarks for source image
